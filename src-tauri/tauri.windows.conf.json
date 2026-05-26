@@ -1,0 +1,15 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "卡卡AI客户端",
+        "titleBarStyle": "Visible",
+        "visible": false,
+        "minWidth": 900,
+        "minHeight": 600
+      }
+    ]
+  }
+}
