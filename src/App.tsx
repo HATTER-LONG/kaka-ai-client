@@ -65,6 +65,7 @@ import {
 } from "@/lib/platform";
 import { AppSwitcher } from "@/components/AppSwitcher";
 import { AwangLoginGate } from "@/components/AwangLoginGate";
+import { StartupToolCheckDialog } from "@/components/StartupToolCheckDialog";
 import { OriginDashboard } from "@/components/OriginDashboard";
 import { OriginRedeemPage } from "@/components/OriginRedeemPage";
 import { ProviderList } from "@/components/providers/ProviderList";
@@ -308,8 +309,8 @@ function App() {
     const officialId = getOfficialProviderId(activeApp);
     const awangId = getAwangProviderId(activeApp);
     return Object.fromEntries(
-      Object.entries(providers).filter(([id]) =>
-        id === officialId || id === awangId,
+      Object.entries(providers).filter(
+        ([id]) => id === officialId || id === awangId,
       ),
     );
   }, [providers, activeApp]);
@@ -337,7 +338,10 @@ function App() {
     () => loadStoredAccount()?.payload ?? null,
     [accountRevision],
   );
-  const awangModels = useMemo(() => getAwangModels(awangAccount), [awangAccount]);
+  const awangModels = useMemo(
+    () => getAwangModels(awangAccount),
+    [awangAccount],
+  );
   const awangModelError =
     awangAccount && awangModels.length === 0
       ? "卡卡AI后台没有返回可用模型"
@@ -1212,6 +1216,7 @@ function App() {
         className="flex flex-col h-screen overflow-hidden bg-background text-foreground selection:bg-primary/30 pb-4"
         style={{ overflowX: "hidden", paddingTop: contentTopOffset }}
       >
+        <StartupToolCheckDialog />
         {(dragBarHeight > 0 || useAppWindowControls) && (
           <div
             className="fixed top-0 left-0 right-0 z-[70] flex items-center justify-end px-2"

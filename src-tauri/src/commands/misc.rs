@@ -7,6 +7,7 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::str::FromStr;
 use tauri::AppHandle;
 use tauri::State;
@@ -96,6 +97,235 @@ pub async fn get_skills_migration_result() -> Result<Option<SkillsMigrationPaylo
     Ok(crate::init_status::take_skills_migration_result())
 }
 
+#[tauri::command]
+pub async fn get_running_startup_tools() -> Result<Vec<RunningToolProcess>, String> {
+    let current_pid = std::process::id();
+    let mut results = Vec::new();
+
+    for process in list_processes().map_err(|e| format!("扫描本机进程失败: {e}"))? {
+        if process.pid == current_pid || is_app_or_build_process(&process) {
+            continue;
+        }
+
+        if let Some(target) = detect_startup_tool(&process) {
+            results.push(RunningToolProcess {
+                tool: target.tool.to_string(),
+                label: target.label.to_string(),
+                pid: process.pid,
+                process_name: process.name,
+            });
+        }
+    }
+
+    results.sort_by(|a, b| {
+        a.label
+            .cmp(&b.label)
+            .then_with(|| a.process_name.cmp(&b.process_name))
+            .then_with(|| a.pid.cmp(&b.pid))
+    });
+    results.dedup_by_key(|item| item.pid);
+    Ok(results)
+}
+
+#[tauri::command]
+pub async fn kill_startup_tool_processes(
+    pids: Vec<u32>,
+) -> Result<Vec<KillToolProcessResult>, String> {
+    let current_pid = std::process::id();
+    let process_map: HashMap<u32, ProcessSnapshot> = list_processes()
+        .map_err(|e| format!("扫描本机进程失败: {e}"))?
+        .into_iter()
+        .map(|process| (process.pid, process))
+        .collect();
+
+    let mut results = Vec::new();
+    for pid in pids {
+        if pid == 0 || pid == current_pid {
+            results.push(KillToolProcessResult {
+                pid,
+                success: false,
+                error: Some("拒绝结束当前应用进程".to_string()),
+            });
+            continue;
+        }
+
+        match process_map.get(&pid) {
+            Some(process) if detect_startup_tool(process).is_some() => match kill_process(pid) {
+                Ok(()) => results.push(KillToolProcessResult {
+                    pid,
+                    success: true,
+                    error: None,
+                }),
+                Err(error) => results.push(KillToolProcessResult {
+                    pid,
+                    success: false,
+                    error: Some(error),
+                }),
+            },
+            Some(_) => results.push(KillToolProcessResult {
+                pid,
+                success: false,
+                error: Some("目标进程不再属于受支持的工具".to_string()),
+            }),
+            None => results.push(KillToolProcessResult {
+                pid,
+                success: true,
+                error: None,
+            }),
+        }
+    }
+
+    Ok(results)
+}
+
+fn detect_startup_tool(process: &ProcessSnapshot) -> Option<&'static StartupToolTarget> {
+    let name = process.name.to_ascii_lowercase();
+    let command_line = process.command_line.to_ascii_lowercase();
+
+    STARTUP_TOOL_TARGETS.iter().find(|target| {
+        target.keywords.iter().any(|keyword| {
+            let keyword = keyword.to_ascii_lowercase();
+            process_name_matches(&name, &keyword) || command_line.contains(&keyword)
+        })
+    })
+}
+
+fn process_name_matches(name: &str, keyword: &str) -> bool {
+    let normalized = name.trim_end_matches(".exe");
+    normalized == keyword
+        || normalized == format!("{keyword}-cli")
+        || normalized == format!("{keyword}.cmd")
+        || normalized == format!("{keyword}.ps1")
+}
+
+fn is_app_or_build_process(process: &ProcessSnapshot) -> bool {
+    let name = process.name.to_ascii_lowercase();
+    let command_line = process.command_line.to_ascii_lowercase();
+    name.contains("kaka-ai-client")
+        || command_line.contains("kaka-ai-client")
+        || name == "cargo"
+        || name == "cargo.exe"
+        || name == "rustc"
+        || name == "rustc.exe"
+}
+
+#[cfg(target_os = "windows")]
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct WindowsProcessSnapshot {
+    process_id: u32,
+    name: Option<String>,
+    command_line: Option<String>,
+}
+
+#[cfg(target_os = "windows")]
+fn list_processes() -> Result<Vec<ProcessSnapshot>, String> {
+    let script = "Get-CimInstance Win32_Process | Select-Object ProcessId,Name,CommandLine | ConvertTo-Json -Compress";
+    let output = Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            script,
+        ])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|e| format!("执行 PowerShell 失败: {e}"))?;
+
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("解析进程列表失败: {e}"))?;
+    let raw_processes: Vec<WindowsProcessSnapshot> = match value {
+        serde_json::Value::Array(_) => {
+            serde_json::from_value(value).map_err(|e| format!("解析进程列表失败: {e}"))?
+        }
+        serde_json::Value::Object(_) => {
+            vec![serde_json::from_value(value).map_err(|e| format!("解析进程列表失败: {e}"))?]
+        }
+        _ => Vec::new(),
+    };
+
+    Ok(raw_processes
+        .into_iter()
+        .map(|process| ProcessSnapshot {
+            pid: process.process_id,
+            name: process.name.unwrap_or_default(),
+            command_line: process.command_line.unwrap_or_default(),
+        })
+        .collect())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn list_processes() -> Result<Vec<ProcessSnapshot>, String> {
+    let output = Command::new("ps")
+        .args(["-eo", "pid=,comm=,args="])
+        .output()
+        .map_err(|e| format!("执行 ps 失败: {e}"))?;
+
+    if !output.status.success() {
+        return Err(String::from_utf8_lossy(&output.stderr).trim().to_string());
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut processes = Vec::new();
+    for line in text.lines() {
+        let mut parts = line.trim_start().splitn(3, char::is_whitespace);
+        let Some(pid_text) = parts.next() else {
+            continue;
+        };
+        let Ok(pid) = pid_text.trim().parse::<u32>() else {
+            continue;
+        };
+        let name = parts.next().unwrap_or("").trim().to_string();
+        let command_line = parts.next().unwrap_or("").trim().to_string();
+        processes.push(ProcessSnapshot {
+            pid,
+            name,
+            command_line,
+        });
+    }
+    Ok(processes)
+}
+
+#[cfg(target_os = "windows")]
+fn kill_process(pid: u32) -> Result<(), String> {
+    let output = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|e| format!("执行 taskkill 失败: {e}"))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        let error = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        if error.is_empty() {
+            Err(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        } else {
+            Err(error)
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn kill_process(pid: u32) -> Result<(), String> {
+    let output = Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .output()
+        .map_err(|e| format!("执行 kill 失败: {e}"))?;
+
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&output.stderr).trim().to_string())
+    }
+}
+
 #[derive(serde::Serialize)]
 pub struct ToolVersion {
     name: String,
@@ -109,6 +339,69 @@ pub struct ToolVersion {
 }
 
 const VALID_TOOLS: [&str; 4] = ["claude", "codex", "gemini", "opencode"];
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RunningToolProcess {
+    tool: String,
+    label: String,
+    pid: u32,
+    process_name: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KillToolProcessResult {
+    pid: u32,
+    success: bool,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ProcessSnapshot {
+    pid: u32,
+    name: String,
+    command_line: String,
+}
+
+struct StartupToolTarget {
+    tool: &'static str,
+    label: &'static str,
+    keywords: &'static [&'static str],
+}
+
+const STARTUP_TOOL_TARGETS: &[StartupToolTarget] = &[
+    StartupToolTarget {
+        tool: "claude",
+        label: "Claude Code",
+        keywords: &["claude", "claude-code", "@anthropic-ai/claude-code"],
+    },
+    StartupToolTarget {
+        tool: "codex",
+        label: "Codex",
+        keywords: &["codex", "@openai/codex", "openai.codex"],
+    },
+    StartupToolTarget {
+        tool: "gemini",
+        label: "Gemini",
+        keywords: &["gemini", "@google/gemini-cli"],
+    },
+    StartupToolTarget {
+        tool: "opencode",
+        label: "OpenCode",
+        keywords: &["opencode"],
+    },
+    StartupToolTarget {
+        tool: "openclaw",
+        label: "OpenClaw",
+        keywords: &["openclaw"],
+    },
+    StartupToolTarget {
+        tool: "hermes",
+        label: "Hermes",
+        keywords: &["hermes"],
+    },
+];
 
 #[derive(Debug, Clone, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]

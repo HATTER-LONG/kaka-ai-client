@@ -1065,6 +1065,8 @@ pub fn run() {
             commands::get_init_error,
             commands::get_migration_result,
             commands::get_skills_migration_result,
+            commands::get_running_startup_tools,
+            commands::kill_startup_tool_processes,
             commands::get_app_config_path,
             commands::open_app_config_folder,
             commands::get_claude_common_config_snippet,
